@@ -199,6 +199,39 @@ class SQLiteRepository:
                 (actor_id, idem_key, entity_id, utcnow()),
             )
 
+    def count_by_equipment(self, equipment_id, kinds):
+        counts = {}
+        with self._connect() as connection:
+            for kind in kinds:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS c FROM entities "
+                    "WHERE kind = ? AND json_extract(data, '$.equipment_id') = ?",
+                    (kind, equipment_id),
+                ).fetchone()
+                counts[kind] = int(row["c"])
+        return counts
+
+    def reassign_equipment(self, from_id, to_id, kinds):
+        now = utcnow()
+        counts = {}
+        placeholders = ",".join("?" * len(kinds))
+        with self._connect() as connection:
+            for kind in kinds:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS c FROM entities "
+                    "WHERE kind = ? AND json_extract(data, '$.equipment_id') = ?",
+                    (kind, from_id),
+                ).fetchone()
+                counts[kind] = int(row["c"])
+            connection.execute(
+                "UPDATE entities SET data = json_set(data, '$.equipment_id', ?), "
+                "version = version + 1, updated_at = ? "
+                "WHERE kind IN (%s) AND json_extract(data, '$.equipment_id') = ?" % placeholders,
+                [to_id, now] + list(kinds) + [from_id],
+            )
+            connection.commit()
+        return counts
+
     def ping(self):
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()

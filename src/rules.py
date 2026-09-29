@@ -34,6 +34,15 @@ def _positive(value, field):
     return number
 
 
+def _equipment_for_record(lookup, equipment_id):
+    equipment = _find_one(lookup, "equipment", "id", equipment_id)
+    if not equipment:
+        raise ValidationError("requires equipment")
+    if equipment["status"] == "merged":
+        raise ConflictError("equipment has been merged into a retained equipment; use the retained equipment")
+    return equipment
+
+
 def _validate_equipment(data, lookup):
     asset_no = str(data.get("asset_no", "")).strip()
     if not asset_no:
@@ -44,9 +53,7 @@ def _validate_equipment(data, lookup):
 
 
 def _validate_inspection(data, lookup):
-    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
-    if not equipment:
-        raise ValidationError("inspection requires equipment")
+    _equipment_for_record(lookup, data.get("equipment_id"))
     try:
         datetime.fromisoformat(str(data.get("scheduled_at")).replace("Z", "+00:00"))
     except ValueError:
@@ -55,8 +62,7 @@ def _validate_inspection(data, lookup):
 
 
 def _validate_maintenance(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
-        raise ValidationError("maintenance requires equipment")
+    _equipment_for_record(lookup, data.get("equipment_id"))
     if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
         raise ValidationError("invalid work_type")
     if data.get("work_type") == "component_replacement" and not data.get("part_serial"):
@@ -64,8 +70,7 @@ def _validate_maintenance(data, lookup):
 
 
 def _validate_alarm(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
-        raise ValidationError("alarm requires equipment")
+    _equipment_for_record(lookup, data.get("equipment_id"))
     for alarm in _all(lookup, "alarm"):
         if (
             alarm["data"].get("equipment_id") == data.get("equipment_id")
@@ -95,8 +100,7 @@ def _validate_remediation(data, lookup):
 
 
 def _validate_permit(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
-        raise ValidationError("permit requires equipment")
+    _equipment_for_record(lookup, data.get("equipment_id"))
     if data.get("purpose") not in ("return_to_service", "special_inspection", "temporary_operation"):
         raise ValidationError("invalid permit purpose")
 
@@ -130,18 +134,19 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "equipment_merges": "equipment_merge", "equipment-merges": "equipment_merge",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "equipment_merge": "pending",
     }
     TRANSITIONS = {
         "equipment": {
             "suspend": (("in_service",), "suspended"),
             "out_of_service": (("in_service", "suspended"), "out_of_service"),
             "return_to_service": (("suspended",), "in_service"),
+            "merge": (("suspended",), "merged"),
         },
         "inspection": {
             "pass": (("scheduled",), "passed"),
@@ -175,6 +180,9 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "equipment_merge": {
+            "execute": (("pending", "blocked"), "completed"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -202,11 +210,13 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "equipment_merge": ("admin",),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
         "out_of_service": ("admin", "inspector"),
         "return_to_service": ("admin", "inspector"),
+        "merge": ("admin",),
         "pass": ("admin", "inspector"),
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
@@ -225,6 +235,7 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        ("equipment_merge", "execute"): ("admin",),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),

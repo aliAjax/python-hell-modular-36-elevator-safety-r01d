@@ -84,6 +84,8 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "equipment-merges"]:
+                    return self._send(200, {"items": service.list("equipment_merge")})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -104,6 +106,21 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                if parts == ["api", "equipment-merges"]:
+                    body = self._body()
+                    merge = service.merge_equipment(
+                        actor,
+                        source_id=body.get("source_id"),
+                        source_asset_no=body.get("source_asset_no"),
+                        target_id=body.get("target_id"),
+                    )
+                    return self._send(201, merge)
+                if len(parts) == 4 and parts[:2] == ["api", "equipment-merges"] and parts[3] == "actions":
+                    body = self._body()
+                    action = body.pop("action", None)
+                    if action != "execute":
+                        raise ValidationError("unsupported action for equipment_merge: " + str(action))
+                    return self._send(200, service.execute_merge(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
