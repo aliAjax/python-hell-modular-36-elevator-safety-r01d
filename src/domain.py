@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class DomainError(Exception):
@@ -25,6 +25,15 @@ class ConflictError(DomainError):
 
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
+
+
+class MergeBlockedError(ConflictError):
+    """Device identifier merge must halt; reasons list the supporting evidence."""
+
+    def __init__(self, reasons):
+        self.reasons = reasons or []
+        summary = "; ".join(str(item.get("reason", "unknown")) for item in self.reasons)
+        super().__init__("device merge blocked: " + summary)
 
 
 class Role(str, Enum):

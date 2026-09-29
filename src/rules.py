@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
@@ -15,6 +15,11 @@ def _ensure_role(actor, allowed):
         raise PermissionDenied("role %s is not allowed here" % actor.role)
 
 
+def require_role(actor, allowed):
+    """Public role guard used by use-case orchestration outside the state machine."""
+    _ensure_role(actor, allowed)
+
+
 def _all(lookup, kind):
     return lookup(kind, "*", None) or [] if lookup else []
 
@@ -22,6 +27,21 @@ def _all(lookup, kind):
 def _find_one(lookup, kind, field, value):
     rows = lookup(kind, field, value) or [] if lookup else []
     return rows[0] if rows else None
+
+
+def _usable_equipment(equipment):
+    """Merging or merged equipment cannot take new inspection/maintenance records."""
+    if equipment and equipment["status"] == "merged":
+        raise ConflictError("equipment has been merged away: " + equipment["id"])
+    if equipment and equipment["data"].get("merge_in_progress"):
+        raise ConflictError("equipment is locked by an in-progress merge: " + equipment["id"])
+
+
+def _alarm_equipment_check(equipment):
+    """Alarms are emergency intake and stay open during a merge window; the
+    merge itself halts on a new alarm. Only a merged-away device rejects."""
+    if equipment and equipment["status"] == "merged":
+        raise ConflictError("equipment has been merged away: " + equipment["id"])
 
 
 def _positive(value, field):
@@ -40,6 +60,9 @@ def _validate_equipment(data, lookup):
         raise ValidationError("asset_no is required")
     if _find_one(lookup, "equipment", "asset_no", asset_no):
         raise ConflictError("equipment asset_no already exists: " + asset_no)
+    supervision_code = str(data.get("supervision_code", "")).strip()
+    if supervision_code and _find_one(lookup, "equipment", "supervision_code", supervision_code):
+        raise ConflictError("equipment supervision_code already exists: " + supervision_code)
     _positive(data.get("inspection_interval_days"), "inspection_interval_days")
 
 
@@ -47,6 +70,7 @@ def _validate_inspection(data, lookup):
     equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
     if not equipment:
         raise ValidationError("inspection requires equipment")
+    _usable_equipment(equipment)
     try:
         datetime.fromisoformat(str(data.get("scheduled_at")).replace("Z", "+00:00"))
     except ValueError:
@@ -55,8 +79,10 @@ def _validate_inspection(data, lookup):
 
 
 def _validate_maintenance(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("maintenance requires equipment")
+    _usable_equipment(equipment)
     if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
         raise ValidationError("invalid work_type")
     if data.get("work_type") == "component_replacement" and not data.get("part_serial"):
@@ -64,8 +90,10 @@ def _validate_maintenance(data, lookup):
 
 
 def _validate_alarm(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("alarm requires equipment")
+    _alarm_equipment_check(equipment)
     for alarm in _all(lookup, "alarm"):
         if (
             alarm["data"].get("equipment_id") == data.get("equipment_id")
@@ -101,6 +129,98 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _return_equipment_to_service(actor, entity, data, lookup):
+    if entity["data"].get("merge_in_progress"):
+        raise ConflictError("equipment is locked by an in-progress merge: " + entity["id"])
+    return {}
+
+
+MIGRATING_KINDS = ("inspection", "maintenance", "alarm", "permit")
+
+
+def validate_device_merge(data, lookup):
+    """Validate a merge request and resolve both equipment records.
+
+    Returns (source_equipment, retained_equipment). Identifier uniqueness,
+    new alarms and merge locks are enforced by the service/repository inside
+    a write transaction; here we only validate request shape and basic state.
+    """
+    source_id = str(data.get("source_equipment_id", "")).strip()
+    retained_id = str(data.get("retained_equipment_id", "")).strip()
+    if not source_id:
+        raise ValidationError("source_equipment_id is required")
+    if not retained_id:
+        raise ValidationError("retained_equipment_id is required")
+    if source_id == retained_id:
+        raise ValidationError("cannot merge equipment into itself")
+    source = _find_one(lookup, "equipment", "id", source_id)
+    if not source:
+        raise ValidationError("source equipment not found: " + source_id)
+    retained = _find_one(lookup, "equipment", "id", retained_id)
+    if not retained:
+        raise ValidationError("retained equipment not found: " + retained_id)
+    if retained["status"] == "merged":
+        raise ValidationError("retained equipment has been merged away: " + retained_id)
+    # A merged source is allowed to reach the service so that retries with the
+    # original payload converge onto the existing completed merge job.
+    return source, retained
+
+
+def merge_guard_reasons(source, retained, equipment_list, alarm_list, baseline_alarm_ids):
+    """Return blocking reasons with evidence, or [] when the merge may proceed.
+
+    - code_occupied: an old identifier (asset_no / supervision_code) is still
+      claimed by another live equipment.
+    - new_alarm: an active alarm attached to either participant was not part
+      of the alarm baseline captured when the merge (re)started.
+    """
+    reasons = []
+    source_data, retained_data = source["data"], retained["data"]
+    # Old identifiers may collide with either identifier namespace on another
+    # live device (old asset number reused as a supervision code, etc.).
+    old_codes = []
+    for field in ("asset_no", "supervision_code"):
+        value = str(source_data.get(field, "")).strip()
+        if value:
+            old_codes.append((field, value))
+    for other in equipment_list:
+        if other["id"] in (source["id"], retained["id"]) or other["status"] == "merged":
+            continue
+        other_codes = {
+            "asset_no": str(other["data"].get("asset_no", "")).strip(),
+            "supervision_code": str(other["data"].get("supervision_code", "")).strip(),
+        }
+        for field, value in old_codes:
+            occupants = [name for name, other_value in other_codes.items()
+                         if other_value and other_value == value]
+            for occupant_field in occupants:
+                reasons.append({
+                    "reason": "code_occupied",
+                    "field": field,
+                    "code": value,
+                    "occupying_equipment_id": other["id"],
+                    "occupying_asset_no": other["data"].get("asset_no"),
+                    "occupying_field": occupant_field,
+                })
+    active_statuses = ("received", "dispatched", "resolved")
+    participant_ids = (source["id"], retained["id"])
+    for alarm in alarm_list:
+        if (
+            alarm["data"].get("equipment_id") in participant_ids
+            and alarm["status"] in active_statuses
+            and alarm["id"] not in baseline_alarm_ids
+        ):
+            reasons.append({
+                "reason": "new_alarm",
+                "alarm_id": alarm["id"],
+                "alarm_code": alarm["data"].get("code"),
+                "status": alarm["status"],
+                "equipment_id": alarm["data"].get("equipment_id"),
+                "created_at": alarm.get("created_at"),
+            })
+    return reasons
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
@@ -130,18 +250,20 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "offline_records": "offline_record",
+        "device_merges": "device_merge", "merges": "device_merge",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "offline_record": "received", "device_merge": "in_progress",
     }
     TRANSITIONS = {
         "equipment": {
             "suspend": (("in_service",), "suspended"),
             "out_of_service": (("in_service", "suspended"), "out_of_service"),
             "return_to_service": (("suspended",), "in_service"),
+            "merge_away": (("suspended", "out_of_service"), "merged"),
         },
         "inspection": {
             "pass": (("scheduled",), "passed"),
@@ -175,6 +297,11 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "device_merge": {
+            "block": (("in_progress",), "blocked"),
+            "retry": (("blocked",), "in_progress"),
+            "complete": (("in_progress",), "completed"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -184,6 +311,7 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "offline_record": (),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,11 +330,15 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "offline_record": ("admin", "dispatcher", "maintenance", "inspector"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
         "out_of_service": ("admin", "inspector"),
         "return_to_service": ("admin", "inspector"),
+        "merge_away": ("admin",),
+        "retry": ("admin",),
+        "complete": ("admin",),
         "pass": ("admin", "inspector"),
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
@@ -239,6 +371,7 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("equipment", "return_to_service"): _return_equipment_to_service,
     }
 
     def normalize_kind(self, kind):

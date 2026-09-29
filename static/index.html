@@ -7,5 +7,7 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre></main>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/device-merges               设备标识合并（旧楼资产号 -&gt; 城市监管编码）
+POST /api/offline-records             离线记录同步（旧编码自动映射到保留设备）</pre></main>
 <script>async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>

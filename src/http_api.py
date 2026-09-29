@@ -8,6 +8,7 @@ from .domain import (
     ConflictError,
     DomainError,
     InvalidTransition,
+    MergeBlockedError,
     NotFoundError,
     PermissionDenied,
     ValidationError,
@@ -70,7 +71,10 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if isinstance(exc, MergeBlockedError):
+                payload["reasons"] = exc.reasons
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -101,6 +105,13 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "device-merges"]:
+                    body = self._body()
+                    idem = self.headers.get("Idempotency-Key")
+                    return self._send(
+                        201,
+                        service.start_device_merge(actor, body, idem),
+                    )
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
